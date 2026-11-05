@@ -1,0 +1,211 @@
+# dsh-plugin-printer
+
+把打印机和扫描仪交给 DSH 里的助手直接操作：查设备与能力、按页码/份数/逐份逐页/长边短边双面打印文件、打印测试页、管理打印队列、扫描成图片或**多页 PDF**。
+
+Windows 专用（走 WMI / 注册表 / 打印后台 / WIA），不需要安装任何第三方依赖，PowerShell 就够。
+
+## 提供的工具
+
+| 工具 | 参数 | 作用 |
+| --- | --- | --- |
+| `printer_list` | — | 列出所有打印机：名称、驱动、端口、状态、队列里的作业数、是否共享、哪台是默认 |
+| `printer_info` | `printer` | 查一台打印机的详情与能力：默认机、双面/彩色支持、分辨率、纸张规格、当前双面偏好。只读；不填则查系统默认机 |
+| `printer_print` | `path` `printer` `copies` `pageRange` `collate` `mode` `duplex` `allowDefaultSwitch` `allowHugeJob` `maxPages` `outputFile` `encoding` | 打印文件。文本与图片默认走插件的 GDI 渲染路径，可指定**页码范围、份数、逐份/逐页、长边/短边双面**；其它类型走系统「打印」动词；给 `outputFile` 则打印到文件 |
+| `printer_test_page` | `printer` | 打印 Windows 测试页，用来确认纸路通不通（会真的消耗纸张） |
+| `printer_set_default` | `printer` | 把某台设为系统默认，并读回校验是否真的生效 |
+| `printer_jobs` | `action` `printer` `jobId` | `list` 查队列（谁卡住了、打到第几页）、`cancel` 取消一个作业、`purge` 清空整台打印机队列；取消/清空都先删再回读，作业没消失会报 `stillQueued`，空队列与读不到队列分开说明 |
+| `scanner_list` | — | 列出 WIA 扫描设备（平板扫描仪、带扫描功能的喷墨/激光一体机、相机等） |
+| `scanner_info` | `device` | 查扫描能力（不真的扫描）：有没有进纸器/平板玻璃、支不支持双面、驱动报告的可用格式与分辨率、当前的进纸设置 |
+| `scanner_scan` | `output` `device` `dpi` `mode` `format` `source` `crop` `keepPages` | 扫描一页或多页：存成图片（jpg/png/tif/bmp）或直接合并成一个多页 PDF |
+
+参数细节：
+
+- 打印 `mode`：`auto`（默认：文本与图片走 `gdi`；只给了 `outputFile` 走打印到文件；其它类型走 `verb`）/ `gdi`（插件在进程内把每一页渲染好再交给打印驱动，页码、份数顺序、双面都随这一个作业下发）/ `queue` / `verb`。
+- `pageRange`：默认 `all`（全部）。支持 `1-3`、`5`、`8-`（第 8 页到末页）、`-4`（第 1 到第 4 页）、`odd`（奇数页）、`even`（偶数页），也可以组合成 `1-3,5,8-`。只在 `gdi` 模式下有效。
+- `collate`：`true`（默认，逐份：1,2,3,1,2,3，一份打完再打下一份）/ `false`（逐页：1,1,2,2,3,3，每页打满份数再换下一页）。只在 `gdi` 模式下有效。
+- `duplex`：`off`（默认）/ `long`（长边翻页，最常用）/ `short`（短边翻页）。注意 .NET 的枚举名说的是「绕哪根轴翻页」而不是「装订边」（反向命名），插件内部已按实测映射（`long→Vertical`、`short→Horizontal`），见 1.2.1 修复说明。`gdi` 模式下随作业下发，**不改**这台打印机的设置；`queue`/`verb` 模式只能临时改它的双面偏好并在作业后还原；打印到文件时无效。
+- `allowDefaultSwitch`：默认 `false`。若这个文件类型没有 `printto` 动词、或关联程序会忽略打印机参数（WPS Office 全系就是），插件默认**拒绝打印并说明原因**，而不是悄悄打到默认打印机；只有显式传 `true` 才会临时把系统默认打印机切成目标机、打印、再还原。
+- `allowHugeJob`：默认 `false`。`gdi` 模式下算出来超过页数上限（默认 200 页）的作业先拒绝，防止文件判断错误时把纸盘打空；确认无误再传 `true`。
+- `maxPages`：页数熔断上限，默认 200。`gdi` 渲染出的作业总页数（含份数）超过它就拒绝，不接触打印后台。
+- 打印失败要落纸的地方会**明确拒绝**而不是降级：内容嗅探判为二进制（`notText`）、页数超限（`tooManyPages`）、`-PlanOnly` 用在非 `gdi` 路径（`planOnlyUnsupported`）都会直接报错。
+- `encoding`：queue 模式读文本的编码，`auto`（默认，按 BOM 判断，不是 UTF-8 就按 GBK）/ `utf8` / `gbk` / `unicode`。
+- 扫描 `mode`：`color`（默认）/ `gray`（灰度）/ `text`（黑白文档，体积最小）；`format`：`jpg`（默认）/ `png` / `tif` / `bmp` / `pdf`（所有页面合并成一个多页文件，页面以 JPEG 原样嵌入）。`tif` 是每页各存一个文件，不合成多页 TIFF；单次最多扫 50 页，多页只有进纸器能做。
+- 扫描 `source`：`auto`（默认，有进纸器就先走进纸器；进纸器空就改用平板玻璃并说明）/ `flat`（平板玻璃，只扫一页）/ `feed`（进纸器，可连续多页）。
+- 扫描 `crop`：`off`（默认）/ `a4`（进纸器常按固定行程出图，A4 原稿会多出空白，此值裁到 A4）。**这是破坏性裁剪**：裁掉的部分不会留在输出文件里，只在确实多出空白时用。
+- 扫描 `keepPages`：`format=pdf` 时是否保留每页的 jpg 分页文件，默认 `false`（只留 PDF）。
+- 相对路径按当前会话的工作目录解析。
+
+## 这一版（1.3.0 代码审查整改 → 1.3.5 实机测试修复）
+
+1.3.0 是对 1.2.2 的一次代码审查整改（共 38 项：严重 8、一般 22、建议 8），只做静态整改与无纸回归，**没有做打印/扫描实机测试**。主要变化：
+
+- **动词探测修好了**：`print-file.ps1` 里四处 `Registry::` 路径漏了反斜杠，导致 `printto` 动词探测从来没成功过，WPS 文档一律被拒；现已修正，并加了 `Get-PrintVerb` 回归断言。
+- **不再静默降级**：`gdi` 因内容嗅探（`notText`）或页数熔断（`tooManyPages`）失败时，不再按扩展名偷偷改走 `queue`/`verb`；`-PlanOnly` 在非 `gdi` 路径直接拒绝（`planOnlyUnsupported`），预览不会再真打印。
+- **UTF-16 文本不再被误杀**：BOM 判定前置，`encoding=unicode` 在 `gdi` 路径可用；改名成 `.txt` 的二进制仍会被拒。
+- **取消/清空队列要回读**：`cancel`/`purge` 先删再回读，作业还在就报 `stillQueued`、回读失败报 `verifyFailed`，不再只凭一次 `Delete()` 报成功；结果带请求数、确认删除数、残留数。
+- **打印设置不会残留**：超时被杀进程时，双面偏好与默认打印机状态先落盘（`%TEMP%\dsh-print-restore.json`），下次调用或启动时兜底还原。
+- **扫描失败也保留成果**：中途出错时已扫的页会移出为图片系列并回传，`STAT` 记录告知已完成页数与结束原因；分阶段错误码 `transferFailed`/`saveFailed`/`pdfFailed`/`pdfTooLarge`/`deviceError`。
+- **能力查询不再伪装**：`printer_info`/`scanner_info`/`printer_list` 查不到时明确报 `capsUnreadable`/`scannerUnreadable`/`listUnreadable`，空列表不再冒充「没有设备/没有能力」。
+- **PDF 写手加固**：逐页流式写入，累计上限 512 MB（超限报 `pdfTooLarge`）；入口校验 JPEG 头尾标记；CMYK 加 `/Decode` 反转；xref 偏移宽度校验。
+- **重复代码与死代码清理**：新增 `ps/print-common.ps1`、`ps/wia-common.ps1`、`lib/errors.js`，统一状态位、错误文案与 WIA 访问；`printer_print` 新增 `maxPages` 参数。
+- `test/guard-check.ps1` 从 11 项扩到 20 项断言（嗅探、熔断、UTF-16、动词探测、PlanOnly 拦截、回读字段、MaxPages 透传）。
+
+### 1.3.5（实机测试第五批：扫描改用 eSCL）
+
+进纸器多页在 WIA 上试了三版都没成：这台 HP/WSD 驱动根本不支持多页 WIA 作业（Pages=0 能写入，但随后每次传输都回 E_INVALIDARG；单页作业一结束就把剩下的纸原样吐出来）。这一版把扫描主路径换成设备自带的 eSCL（网络扫描协议），WIA 作为回退：
+
+- 一次作业扫整叠：POST /eSCL/ScanJobs 建一次作业，反复 GET <job>/NextDocument 取页，最后一页之后返回 404 即正常结束。ADF 上限 50 张、300 dpi；平板可到 1200 dpi。
+- 进纸器输入源写 Feeder：这台固件对规范里的 ADF 一律回 409 Conflict（平板 Platen 正常），改成 Feeder 就好了；进纸器空载同样回 409，此时按 feederEmpty 处理，auto 会自动回退平板。
+- 必须关掉 Expect: 100-continue：HttpWebRequest 默认带这个头，gSOAP 服务会回 400；自签证书也要放行。
+- 扫描区固定 A4 2480×3508（eSCL 区域单位是 1/300 英寸），修掉驱动默认 Legal 导致 A4 原稿右侧/底部大片白边的老问题；分辨率按设备自报的能力取最近档。
+- 作业收尾不取消：扫完把作业读到自然结束（404），避免 Canceled 作业堆在设备队列里占住 ADF 会话——实测那会让后续 ADF 作业一直 409。
+- WIA 回退保留：没有 eSCL 的机器仍走原来“一页一个新会话”的 WIA 路径；重编码/裁剪/PAGE 记录抽成 Finish-PageFile 给两条后端共用，行为一致。
+- test/guard-check.ps1 增至 48 项断言：新增 eSCL 设置文档、分辨率取整、输入源标识、后端加载关系等纯函数断言；子进程输出改走文件重定向，避免受限环境下取不到 stdout。
+
+真机结果：进纸器 3 张 A4、一次作业 → 3 页 PDF（每页 2480×3508 @300dpi，PDF 685,472 字节，耗时 15.9 秒）。
+
+### 1.3.4（实机测试第四批：进纸器多页之二）
+
+1.3.3 改完再测，进纸器仍然只出第一页；用一批 WIA 探针把设备行为摸清后重写了多页逻辑：
+
+- **不能把 Pages（3096）设成 0**：1.3.3 按教科书做法把 3096 设成 0（“扫到纸空”），但这台 HP/WSD 驱动在 3096=0 之后对任何一次 Transfer 都回 `0x80070057 E_INVALIDARG`，第一页就传不出来；保持驱动默认的 1 时单页传输正常。现在完全不写 3096，改为**一页一个新会话**，靠 `PAPER_EMPTY`（`0x80210003`）判断纸尽。
+- **一个会话只能传一页**：同一会话里第二次 Transfer 必报 `0x80004005 Unspecified error`（平板与进纸器实测都是如此）。现在每页都重新 `Connect` → 选来源 → 取 `Items.Item(1)` → 重发分辨率/格式/意图/扫描区 → Transfer → 释放，再开下一页；单页失败最多重试一轮（间隔 900 ms、重新连接）。
+- **能力探测会话提前释放**：读能力用的那条 WIA 连接在扫描前释放，避免同时占两个会话（驱动会报 “The WIA device is busy”）。
+- **空载与部分完成语义不变**：进纸器空载 → `feederEmpty` 且不产生文件；中途失败 → 已扫页按图片保留，`STAT` 记录设备名、来源与 stoppedBy。
+
+`test/guard-check.ps1` 增至 48 项断言：新增「scan.ps1 不再写 Set-WiaFeederAllPages」「wia-common.ps1 不再写 3096」「每页开一个会话（Open-ScanItem / Close-ScanItem 存在）」三项静态断言。
+
+### 1.3.3（实机测试第三批：进纸器多页）
+
+进纸器多页扫描第一次实测只出了 1 页，三张原稿被吞进设备却没出图。查出三类原因，全部修掉：
+
+- **进纸器只扫一页**：驱动把 Document Handling / Pages（WIA 属性 3096）默认设成 1，表示「只喂一页」；插件从来没把它改成 0（扫到纸空），所以 ADF 送完第一张就结束。当时只要走 source=feed（或 auto 落到进纸器），就先 Set-WiaFeederAllPages 把它设成 0。（1.3.4 实测发现这个做法会让后续传输全部变成 E_INVALIDARG，已改为每页新开会话，见上节。）
+- **第二页起格式/分辨率回退成驱动默认**：进纸器每一页都是一个新的 WIA item，属性回到默认值；旧代码只在第一页下发过 4106（格式）与分辨率，后面几页只设了 6146（意图），于是第二张按驱动的原生格式（这台是 BMP，且不接受 JPEG 直传）传输，驱动回一句泛化的「Unspecified error」。现在每一页都重新下发分辨率（6147/6148）、格式（4106）与意图；crop=a4 时还会先按 A4 设扫描区（6149/6150=0、6151 约 2480、6152 约 3508），少扫白边也少传数据。
+- **通用传输错误不再一次就放弃**：上一张还在出纸时驱动可能抛出泛化错误，属于可重试的瞬态。现在同一页最多试两轮，第二轮前等 700 ms、重连设备、重设来源与页面属性再传；两轮都失败才报错。
+- **失败结果不再冒充成功**：以前中途失败时 STAT 的 stoppedBy 还写 complete、设备与来源也是空的，宿主就打出「扫描完成：，共 1 页。」。现在失败时强制 stoppedBy=error 并把设备名与来源写进 STAT，宿主标题改为「扫描未完成」；进纸器空载单独报 feederEmpty（不再伪装成完成）。
+- **扫描设备名也支持前缀匹配**（和打印机一致）：写 NPIC849E4 就能命中 NPIC849E4 (HP Color LaserJet MFP M283cdw)；前缀同时命中多台时报 scannerAmbiguous 并列出候选，不会随便挑一台。
+
+`test/guard-check.ps1` 增至 38 项断言：新增「300 dpi 的 A4 扫描区是 2480×3508」「设备前缀唯一命中」「前缀歧义要报错」三项（都是纯函数，不接设备）。
+
+### 1.3.2（实机测试第二批发现的问题）
+
+扫描实机测试（平板 300 dpi、扫成 PDF、灰度、dpi 越界、`crop=a4`）发现并修掉三项：
+
+- **扫描链路根本跑不起来**：`scan.ps1` 的扫描函数把设备条目（哈希表）当成 COM 设备对象用了（`$chosen.Connect()`），一调用就报「[System.Collections.Hashtable] 不包含名为 Connect 的方法」——1.3.0/1.3.1 的扫描其实完全不可用，只是没实机跑过所以没暴露。改为 `$chosen.info.Connect()`，并把图像处理函数抽到新文件 `ps/image-common.ps1`，方便无纸回归。
+- **`crop=a4` 会把 A4 裁成四分之一**：这台驱动在文件头里写 96 dpi，实际按 300 dpi 扫描；1.3.1 用文件头 dpi 当裁剪尺子，导致 2479×3507 的整页被裁成 794×1123。现在改用驱动回读的协商分辨率（`effectiveDpi`）当尺子，拿不到协商值才退回文件头。
+- **保存的图片分辨率标错**：同因，转码后的 jpg 全部标成 96 dpi，别的程序按它排版会放大约 3 倍。转码时按协商分辨率重建位图（`SetResolution`），现在 jpg 标 300 dpi。
+
+`test/guard-check.ps1` 增至 35 项断言：新增「转码写入协商分辨率」「A4 裁剪用协商分辨率、不误裁」「长进纸页裁到 A4」四项。
+
+### 1.3.1（实机测试第一批发现的问题）
+
+2026 年 10 月在 HP Color LaserJet MFP M283cdw 上跑「只读查询、打印到文件、错误路径」三组实机测试，发现并修掉四项：
+
+- **能力不再报「未知」**：这台 HP V4 驱动的 `Win32_Printer` 根本没有 `Duplex`/`Color` 属性，1.3.0 只读这两个属性，于是 `printer_info` 对一台支持双面彩打的机器报「双面/彩色：未知」。1.3.1 依次从 WMI 属性、`Win32_Printer.Capabilities` 能力位（2=彩色、4=双面）、GDI `PrinterSettings.CanDuplex`/`SupportsColor` 三级取值，`CAPS` 记录多带两个来源字段；宿主把推断来的值标成「（由驱动能力位推断）」或「（由打印驱动接口推断）」，不再把推断当驱动事实。
+- **扫描设备自带在线状态**：同一台一体机同时登记了 WIA 与 eSCL 两个条目，eSCL 那个长期离线，而 `scanner_scan` 不指定 `device` 时原来取第一台，恰好可能选到离线条目。现在 `scanner_list` 逐台试开并标出「可用 / 现在打不开」，`scanner_scan` 不指定设备时自动挑第一台能打开的，全部打不开才报 `deviceError` 并列出各台的错误。
+- **未知打印机文案补句号**：`no printer named "X" is installed. Available: …` 原来结尾没有句号，和后面的建议（`Retry with mode=queue …`）粘成一句。
+- **扫描分辨率描述改正**：工具描述不再写死「最高 1200」，改成「可填 75~1200，实际能到多少由设备决定」，并建议先查 `scanner_info`；这台机器实际只有 75/150/300 dpi。
+
+`test/guard-check.ps1` 增至 30 项断言：新增未知打印机文案、`CAPS` 12 字段与来源字段、能力位/GDI 回退、宿主解析来源、扫描设备可用性字段、默认扫描跳过打不开的设备。
+
+## 更早的版本（1.2.2 安全补丁 / 1.2.1 修复 / 1.2.0 新增）
+
+- **1.2.2 安全补丁（重要）**：`gdi` 模式只接受文本与图片，但现在**先嗅探文件内容再渲染**。此前它只看扩展名，于是显式写 `mode=gdi` 打一个 PDF 时，插件会把 PDF 的二进制当文本解码——一份 15 页的报告因此变成了 **932 页**的作业塞进打印队列。现在开头是 `%PDF-`、`PK`（zip/OOXML）、OLE、`{\rtf`、gzip/RAR/7z、`MZ`、ELF 或前 8192 字节里出现 NUL 字节的文件一律拒绝（错误码 `notText`），并提示改用 `verb` 或先转成文本/图片。
+- **1.2.2 页数熔断**：算出来的页数超过 200 页时先拒绝（错误码 `tooManyPages`），确认文件无误可用 `allowHugeJob=true` 放行。这两道闸都在真正接触打印后台之前生效，不会产生作业。
+- **1.2.2 顺带**：`print-gdi.ps1` 现在自带 `Read-TextSmart`，GDI 后端可以独立 dot-source 并被回归脚本直接测试；新增 `test/guard-check.ps1`（1.3.4 起为 48 项断言，不碰打印后台、不耗纸）。
+- **1.2.1 修复**：`gdi` 模式下 `duplex=long`（长边翻页）的背面 180° 倒转 —— 1.2.0 把长边错映射成 .NET `Duplex.Horizontal`（短边装订），已按驱动实测改成 `long→Vertical` / `short→Horizontal`。
+- 打印可以决定**双面是长边还是短边翻页**（`duplex=long/short`），并且 `gdi` 模式是随作业下发、不动打印机的默认设置。
+- 打印可以决定**页码范围**（`pageRange`：`1-3`、`8-`、`odd`、`1-3,5` …）与**份数**（`copies`）。
+- 打印可以决定多份时是**逐份**还是**逐页**（`collate`）。
+- 新增 `mode=gdi`：插件自己在进程内渲染每一页（文本与图片），因此页码/份数顺序/双面全都可控；真实数据验证见下方「已知限制」。
+- 修掉一个从 1.0.0 起就存在的静默 bug：`mode` 参数被同名局部变量覆盖，导致 `-mode queue|verb` 从来没生效过（`auto` 的选路恰好一致才没暴露）。
+
+## 安装
+
+官方入口是 DSH 的插件管理器（`plugin_manager` / GUI 的插件页），**不要手工改 profile 的 `package.json` 和 `cordis.patch.yml`**。
+
+1. 打开 DSH 的插件管理界面；
+2. 选「从本地目录安装 / install bundle」，目录填插件源码目录（或指向 `dsh-plugin-printer-1.3.4.tgz`）；
+3. 看返回的 `application`：`applied` 表示已经生效，`restart-required` 表示要重启 DSH；
+4. 用 `cordis_inspect_query`（或插件的工具列表）确认 `dsh-plugin-printer` 这一行存在。
+
+升级到 1.3.4：用同样的入口重新安装覆盖即可；如果 profile 里是 `link:<插件源码目录>` 形态，源码改完**重启 DSH** 就会加载新的 `index.js` / `lib/*.js`（`ps/*.ps1` 是每次调用现读的，改完立刻生效，不必重启）。
+
+包本身是标准的 host-only Cordis 插件：`package.json`（带 `dsh.bundle.patch`）+ `cordis.patch.yml`（`insert` 一行，`name` 必须等于包名）+ `index.js`（`apply(ctx, config)`）。`config` 可传 `powershell`（默认 `powershell.exe`）和 `timeoutMs`（默认 180000）。
+
+## 权限
+
+- 这些工具跑在 DSH 宿主进程里，用的是**当前登录用户**的权限，不受工作区沙箱限制；DSH 本身没有特权要求。
+- 但 WMI（打印机状态、打印队列、打印机能力）、WIA（扫描仪）和打印首选项（PrintManagement）对**低完整性/受限令牌**会直接拒绝访问（`0x80070005`）。遇到这种情况插件会明确告诉你「需要普通用户权限」，而不是假装队列是空的、或假装双面设置成功了。
+- 若机器上一直失败：确认 DSH 不是以受限方式启动；个别机器的 WIA 需要 `stisvc` 服务在运行。
+
+## 已知限制（真机验证过）
+
+1. **「Microsoft Print to PDF」不认 `outputFile`。** 它的端口是 `PORTPROMPT:`，由驱动自己弹「保存打印输出为」窗口决定文件名和位置（通常是桌面，名字是自动生成的）。插件的做法是：打印后去桌面/文档/下载/临时目录找刚生成的 PDF，**把它移到你要的路径**，并在结果里如实写出「驱动实际把它写到了哪里」。如果它弹着窗口没人点，工具会等一段时间后报错并提示你去确认那个窗口。
+2. **走系统「打印」动词可能改默认打印机。** 这是 Windows「让 Windows 管理默认打印机」的行为，不是插件干的。1.1.0 起，对没有 `printto` 动词或会忽略打印机参数的类型（WPS/Office 系）插件会直接拒绝，只有 `allowDefaultSwitch=true` 才会临时改默认机并在打印后还原。想彻底关掉自动改默认：`HKCU\Software\Microsoft\Windows NT\CurrentVersion\Windows` 下新建 DWORD `LegacyDefaultPrinterMode = 1`。`printer_set_default` 可以随时把默认机改回来。
+3. **属性设置失败不静默。** 扫描时如果机器不接受请求的分辨率（例如请求 200 dpi，这台只支持 75/150/300），插件会自动取最接近的可用值，并把「不接受 200 dpi，实际按 150 dpi」写进结果；驱动不支持的格式会先按它的原生格式拿图再转码，并把原生格式写进结果。双面同理：设置没生效会在结果里带 `WARN` 和驱动的原话。
+4. **`printer_print` 的 queue 模式只适合纯文本。** 它把文本重排成 UTF-8 再送 spooler，保证中文不乱码；富文本/图片/PDF 请让 `mode` 走 `verb`（或先转成 PDF 再打印）。
+5. **打印结果里的队列回读可能是 `unknown`。** 作业在打印队列里常常只停留几百毫秒，而插件只在提交后采样一次；`unknown` 是「没看到作业」，不等于「没有打印」。物理上是否出纸/是否双面，软件无法确认。
+6. **`queue`/`verb` 模式下的 `duplex` 改的是这台打印机的默认打印偏好**（Windows 打印首选项），不是只作用于当前作业；插件在作业结束后会还原成原值，还原失败会在结果里报 `WARN`。这段时间里别的程序打印也会受影响。`gdi` 模式没有这个问题，它不改偏好。
+7. **`gdi` 只能打印文本和图片，页码/逐份也只在这条路上有效。** PDF、Word/Excel/PPT 等仍然只能交给系统「打印」动词或关联程序，插件插不上手；对这类文件传 `pageRange` 或 `collate=false` 会被明确拒绝并提示改用 `gdi`（或先转成文本/图片）。
+8. **`gdi` + `outputFile` 对「Microsoft Print to PDF」无效。** 这台驱动忽略 print-to-file（报 `can't open file for write !`）；打印到 PDF 请用 `mode=file`，或改用支持 print-to-file 的队列（如「Microsoft XPS Document Writer」）。
+9. **GDI 队列名可能和 `printer_list` 里的名字不同**（例如列表里是 `Microsoft XPS Document Writer v4`，GDI 里是 `Microsoft XPS Document Writer`）。插件会自动匹配，并在结果里写出实际用的名字。
+10. **`gdi` 模式的两道安全闸（1.2.2）。** 第一道：文本/图片以外的文件（PDF、Office、压缩包、可执行文件）在渲染前就被拒绝，错误码 `notText`，提示改用 `verb` 或先转成文本/图片——这是为了修掉「把 PDF 当文本渲染成 932 页」的事故。第二道：算出来超过页数上限（默认 200 页，可用 `maxPages` 调整）先拒绝（`tooManyPages`），确认后用 `allowHugeJob=true` 放行。两道闸都在接触打印后台之前生效，不会产生作业。
+11. **进纸器扫空是正常结束。** 只有一张都没扫到、且设备也没有平板时才会报「进纸器没有纸」；已经扫到的页面会保留（PDF 里会有已扫到的页）。`crop=a4` 是破坏性裁剪，非 A4 的原稿别开。
+12. **取消/清空队列以回读为准（1.3.0）。** `printer_jobs` 的 `cancel`/`purge` 会先删、再读一次队列：作业还在就报 `stillQueued`，读不到队列就报 `verifyFailed`，不会只凭一次删除调用就报成功；结果里带请求数、确认删除数与残留数。
+13. **`-PlanOnly` 只对 `gdi` 路径有效（1.3.0）。** `queue`/`verb`/打印到文件没法在不打印的前提下预演，传了会直接报 `planOnlyUnsupported`；想看页码/份数/双面的计划，请让文件走 `gdi`（文本或图片）。
+14. **多页 PDF 有体积上限（1.3.0）。** 累计超过 512 MB 时停止组装并报 `pdfTooLarge`，已经扫到的页面仍会告知；改用 `format=jpg` 或降低分辨率即可。
+15. **能力值可能是推断出来的，不是驱动自报的（1.3.1）。** 部分驱动（如这台 HP 的 V4 驱动）根本不暴露 `Win32_Printer.Duplex`/`Color`，`printer_info` 会依次改用能力位与 GDI 驱动接口推断，并在结果里标「由驱动能力位推断 / 由打印驱动接口推断」。真正的执行结果（双面是否生效、是否彩色）仍以打印任务和实机出纸为准。
+16. **扫描列表里的设备可能重复（1.3.1）。** 一台一体机常常同时被登记成 WIA 设备与 eSCL 设备，后者可能长期离线；`scanner_list` 会逐台试开并标出当前能否打开，`scanner_scan` 不指定 `device` 时自动跳过打不开的条目。若指定了离线条目，会如实报错而不会退回别的设备。
+17. **扫描分辨率上限因机而异（1.3.1）。** 参数允许 75~1200，但实际可用的档位由驱动决定（这台机器只有 75/150/300），插件会取最近的一档并在结果里写 `effectiveDpi`；想先知道可用档位就查 `scanner_info`。
+
+19. **进纸器多页（1.3.4/1.3.5）。** 1.3.5 起进纸器优先走 eSCL；回退到 WIA 时靠“一页一个 WIA 会话 + PAPER_EMPTY 收尾”：每页重新连接设备、重发格式/分辨率/扫描区，单页失败重试一轮。驱动把 `Pages`(3096) 设成 0 会让后续传输全部 `E_INVALIDARG`，所以插件从不写这个属性。进纸器空载正常结束并保留已扫页；中途出错时已扫页仍按图片保存。
+20. **进纸器默认扫描区可能是 Legal（1.3.3）。** 这台 HP/WSD 驱动把进纸器默认区设成 8.5×14 英寸（2550×4200 @300dpi），A4 原稿右侧/底部会多出空白；`crop=a4` 现在同时先按 A4 设扫描区、扫完再按协商分辨率裁剪。原稿不是 A4 时别开 `crop=a4`。
+
+## 目录结构
+
+```
+dsh-plugin-printer/
+  package.json          # 包元数据 + dsh.bundle.patch 指向补丁文件
+  cordis.patch.yml      # 往 Cordis 树里 insert 一行
+  index.js              # 插件入口：注册 9 个工具、中文化结果
+  lib/ps.js             # 起 powershell、按 US(0x1f) 分隔解析记录、超时杀进程树、管道被拒时退回临时文件捕获；出错也把已解析的记录带回来
+  lib/printers.js       # 打印机：列表/能力/默认/测试页/打印/队列（队列删除带回读字段）
+  lib/scanners.js       # 扫描仪：枚举/能力/扫描（含 PDF、部分成功与 STAT）
+  lib/errors.js         # 错误码 → 中文文案（打印/队列/扫描统一一处）
+  ps/print-common.ps1   # 注册表读取、打印动词探测、打印机状态位、可用打印机清单、错误文案
+  ps/wia-common.ps1     # WIA 设备枚举、属性读写、格式与分辨率协商
+  ps/escl-common.ps1    # eSCL（网络扫描）客户端：能力/状态/建作业/取页/残留作业清理
+  ps/list-printers.ps1  ps/printer-caps.ps1  ps/printer-action.ps1  ps/printer-jobs.ps1
+  ps/print-file.ps1     # 打印总入口（选路 + queue / verb / 打印到文件 / 双面 / 待还原状态）
+  ps/print-gdi.ps1      # GDI 逐页渲染：页码范围、份数顺序（逐份/逐页）、双面方向、折行与裁区
+  ps/list-scanners.ps1  ps/scanner-info.ps1  ps/scan.ps1  ps/pdf.ps1
+  locale/zh.json        # 插件标题与说明
+  icon.svg
+  test/guard-check.ps1  # 无纸回归（48 项断言，不装 DSH 也能跑）
+```
+
+`ps/*.ps1` 全部保持纯 ASCII：PowerShell 5.1 在没有 BOM 时按 ANSI 读脚本，中文只放在 JS 一侧，避免乱码。
+
+## 本地测试（不装 DSH）
+
+```powershell
+cd dsh-plugin-printer
+
+# 无纸回归：48 项断言，不碰打印后台、不耗纸
+powershell -NoProfile -ExecutionPolicy Bypass -File ./test/guard-check.ps1
+
+# 只看页码/份数/双面的打印计划，不真的打印
+powershell -NoProfile -ExecutionPolicy Bypass -File ./ps/print-file.ps1 -Path ./README.md -PageRange 2-3 -Copies 3 -PlanOnly
+```
+
+`test/guard-check.ps1` 只依赖 `ps/*.ps1` 与系统自带的 Windows PowerShell / System.Drawing，不装 DSH 也能跑；它覆盖内容嗅探、页数熔断、UTF-16 文本、`.pdf`/`.docx` 动词探测、`-PlanOnly` 拦截、队列回读字段、能力来源字段、扫描设备可用性与 `maxPages` 透传。
+
+## 卸载
+
+插件管理器里卸载，或从 profile 的 `dsh.profile.bundles` 去掉 `dsh-plugin-printer` 并重启 DSH。
+
+21. **扫描优先走 eSCL（1.3.5）。** 网络扫描器若在 HTTPS 上提供 eSCL，插件优先用它——只有它能一次作业扫完整叠进纸器；没有 eSCL 的机器回退 WIA，而部分 WIA 驱动（如这台 HP）不支持多页，进纸器一次只能出 1 页。
+22. **eSCL 的进纸器只到 300 dpi。** 平板可到 1200 dpi，ADF 上限 300 dpi；超过会自动取最近档并写进 effectiveDpi。
+
+18. **扫描的灰度/黑白取决于驱动（1.3.2）。** `mode=gray` 与 `mode=text` 只是把意图交给 WIA，驱动不一定兑现：测试机 `gray` 确实返回灰度图，`text` 仍返回彩色/灰阶图。以输出文件的真实内容为准，插件不替驱动二次转换。

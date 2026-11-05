@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-plugin-printer
+      name: dsh-plugin-printer
+      config:
+        powershell: powershell.exe
+        timeoutMs: 180000

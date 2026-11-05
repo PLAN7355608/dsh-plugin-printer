@@ -1,0 +1,6 @@
+﻿node_modules/
+.npm-cache/
+*.tgz
+_lab/
+versions/
+dist/*.zip

@@ -6,8 +6,212 @@
 >
 > 警告：该项目代码完全由人工智能生成，本人无任何代码能力；若因使用这些代码产生任何人员伤亡和财产损失，本人概不负责。
 
-Hand printers and scanners to the assistant inside DSH: list devices and their capabilities, print files with page ranges / copies / collated or uncollated order / long-edge or short-edge duplex, print a test page, manage the print queue, and scan to images or a **multi-page PDF**.
+Hand printers and scanners to an assistant inside DSH and let it operate them directly: inspect devices and capabilities, print files by page range / copies / collated or uncollated / long-edge or short-edge duplex, print a test page, manage print queues, and scan to images or **multi-page PDF**.
 
-Windows only (it goes through WMI, the registry, the print spooler and WIA). No third-party dependencies — PowerShell is enough.
+Windows only (via WMI / registry / print spooler / WIA); no third-party dependencies are needed — PowerShell is enough.
 
-The full documentation, including every tool and its parameters, is written in Chinese: see [README.md](README.md).
+## Tools provided
+
+| Tool | Parameters | Purpose |
+| --- | --- | --- |
+| `printer_list` | — | List all printers: name, driver, port, status, number of jobs in the queue, whether shared, which one is the default |
+| `printer_info` | `printer` | Query one printer's details and capabilities: default printer, duplex/color support, resolution, paper sizes, current duplex preference. Read-only; when omitted, the system default printer is queried |
+| `printer_print` | `path` `printer` `copies` `pageRange` `collate` `mode` `duplex` `allowDefaultSwitch` `allowHugeJob` `maxPages` `outputFile` `encoding` | Print a file. Text and images use the plugin's GDI rendering path by default, with **page range, copies, collated/uncollated, long-edge/short-edge duplex** selectable; other types go through the system "print" verb; with `outputFile` it prints to a file |
+| `printer_test_page` | `printer` | Print the Windows test page to confirm the paper path works (really consumes paper) |
+| `printer_set_default` | `printer` | Make a printer the system default and read it back to verify that it actually took effect |
+| `printer_jobs` | `action` `printer` `jobId` | `list` inspects the queue (what is stuck, how many pages printed), `cancel` cancels one job, `purge` clears a whole printer's queue; both cancel and purge delete first and then read back — a job that did not disappear is reported as `stillQueued`, and "the queue is empty" versus "the queue could not be read" are reported separately |
+| `scanner_list` | — | List WIA scanning devices (flatbed scanners, inkjet/laser all-in-ones with scanning, cameras, etc.) |
+| `scanner_info` | `device` | Query scanning capabilities (without actually scanning): whether there is a feeder / flatbed, whether duplex is supported, the formats and resolutions the driver reports, the current feeder settings |
+| `scanner_scan` | `output` `device` `dpi` `mode` `format` `source` `crop` `keepPages` | Scan one or more pages: save as images (jpg/png/tif/bmp) or merge them directly into one multi-page PDF |
+
+Parameter details:
+
+- Print `mode`: `auto` (default: text and images use `gdi`; when only `outputFile` is given, print-to-file is used; other types use `verb`) / `gdi` (the plugin renders every page in-process and then hands it to the print driver, so page range, copy order and duplex all travel with this one job) / `queue` / `verb`.
+- `pageRange`: default `all` (everything). Supports `1-3`, `5`, `8-` (page 8 to the last page), `-4` (page 1 to page 4), `odd` (odd pages), `even` (even pages), and combinations such as `1-3,5,8-`. Only effective in `gdi` mode.
+- `collate`: `true` (default, collated: 1,2,3,1,2,3 — one complete copy at a time) / `false` (uncollated: 1,1,2,2,3,3 — every page printed as many times as there are copies, then the next page). Only effective in `gdi` mode.
+- `duplex`: `off` (default) / `long` (flip on the long edge, the most common) / `short` (flip on the short edge). Note that the .NET enum names describe "which axis to flip around" rather than "which edge is bound" (reverse naming); the plugin already maps them according to real-device tests (`long→Vertical`, `short→Horizontal`), see the 1.2.1 fix note. In `gdi` mode it travels with the job and does **not** change this printer's settings; `queue`/`verb` modes can only temporarily change its duplex preference and restore it after the job; it has no effect when printing to a file.
+- `allowDefaultSwitch`: default `false`. If this file type has no `printto` verb, or the associated program ignores the printer parameter (the entire WPS Office family does), the plugin **refuses to print and explains why** instead of silently printing to the default printer; only an explicit `true` temporarily switches the system default printer to the target, prints, and restores it afterwards.
+- `allowHugeJob`: default `false`. In `gdi` mode a job calculated to exceed the page limit (200 pages by default) is rejected first, so that a misjudged file cannot empty the paper tray; pass `true` once you are sure.
+- `maxPages`: page-count circuit breaker, 200 by default. A job whose total rendered page count (copies included) exceeds it is rejected without touching the print spooler.
+- Where a print failure would have to degrade, the plugin **refuses explicitly** instead of downgrading: content sniffed as binary (`notText`), page count over the limit (`tooManyPages`), and `-PlanOnly` used on a non-`gdi` path (`planOnlyUnsupported`) all fail directly.
+- `encoding`: the encoding used to read text in queue mode, `auto` (default, decided by BOM; GBK if not UTF-8) / `utf8` / `gbk` / `unicode`.
+- Scan `mode`: `color` (default) / `gray` (grayscale) / `text` (black-and-white document, the smallest output); `format`: `jpg` (default) / `png` / `tif` / `bmp` / `pdf` (all pages merged into one multi-page file, with the pages embedded as JPEG exactly as they are). `tif` writes one file per page and does not combine them into a multi-page TIFF; at most 50 pages per scan, and multi-page requires a feeder.
+- Scan `source`: `auto` (default: use the feeder when there is one; if the feeder is empty, switch to the flatbed and say so) / `flat` (flatbed, one page only) / `feed` (feeder, continuously multi-page).
+- Scan `crop`: `off` (default) / `a4` (a feeder usually emits a fixed travel length, so an A4 original leaves extra blank space; this value crops to A4). **This is a destructive crop**: the cropped part is not kept in the output file, so only use it when there really is extra blank space.
+- Scan `keepPages`: with `format=pdf`, whether to keep the per-page jpg files, `false` by default (PDF only).
+- Relative paths are resolved against the current session's working directory.
+
+## This release (1.3.0 code-review remediation → 1.3.5 real-device test fixes)
+
+1.3.0 was a code-review remediation of 1.2.2 (38 items in total: 8 critical, 22 normal, 8 suggestions) that did static fixes and paperless regression only, **with no real-device printing/scanning tests**. Main changes:
+
+- **Verb detection fixed**: four `Registry::` paths in `print-file.ps1` were missing a backslash, so `printto` verb detection had never worked and WPS documents were rejected across the board; this is now fixed, and a `Get-PrintVerb` regression assertion was added.
+- **No more silent downgrading**: when `gdi` fails because of content sniffing (`notText`) or the page-count breaker (`tooManyPages`), it no longer quietly switches to `queue`/`verb` based on the extension; `-PlanOnly` is rejected outright on non-`gdi` paths (`planOnlyUnsupported`), so a preview can no longer really print.
+- **UTF-16 text is no longer killed by mistake**: BOM detection now happens first, and `encoding=unicode` works on the `gdi` path; binary files renamed to `.txt` are still rejected.
+- **Cancel/purge must read back**: `cancel`/`purge` delete first and then read the queue again; a job still there reports `stillQueued`, a failed read-back reports `verifyFailed`, and success is never declared from a single `Delete()` call; the result carries the requested count, the confirmed-deleted count and the remaining count.
+- **Print settings do not linger**: when a process is killed on timeout, the duplex preference and the default-printer state are written to disk first (`%TEMP%\dsh-print-restore.json`) and restored on the next call or at startup.
+- **Failed scans keep what they got**: when an error occurs midway, the pages already scanned are moved out as an image series and returned, and a `STAT` record states the completed page count and the reason for stopping; staged error codes `transferFailed`/`saveFailed`/`pdfFailed`/`pdfTooLarge`/`deviceError`.
+- **Capability queries no longer pretend**: when `printer_info`/`scanner_info`/`printer_list` cannot read, they report `capsUnreadable`/`scannerUnreadable`/`listUnreadable` explicitly, and an empty list no longer masquerades as "no devices / no capabilities".
+- **PDF writer hardened**: pages are streamed one by one, with a cumulative limit of 512 MB (`pdfTooLarge` when exceeded); JPEG head and tail markers are validated at entry; CMYK gets a `/Decode` inversion; xref offset widths are validated.
+- **Duplicate and dead code cleaned up**: added `ps/print-common.ps1`, `ps/wia-common.ps1` and `lib/errors.js` to unify status flags, error text and WIA access; `printer_print` gained a `maxPages` parameter.
+- `test/guard-check.ps1` grew from 11 to 20 assertions (sniffing, breaker, UTF-16, verb detection, PlanOnly interception, read-back fields, MaxPages passthrough).
+
+### 1.3.5 (fifth real-device test batch: scanning switched to eSCL)
+
+Feeder multi-page never worked on WIA across three attempts: this HP/WSD driver simply does not support multi-page WIA jobs (Pages=0 can be written, but every subsequent transfer then returns E_INVALIDARG; as soon as a single-page job finishes, the remaining paper is spat back out untouched). This release switches the main scanning path to the device's own eSCL (network scanning protocol), with WIA as a fallback:
+
+- One job scans the whole stack: POST /eSCL/ScanJobs creates a job, then GET <job>/NextDocument fetches pages repeatedly, and a 404 after the last page is the normal end. The ADF limit is 50 sheets at 300 dpi; the flatbed can go up to 1200 dpi.
+- The feeder input source is written as Feeder: this firmware returns 409 Conflict for the spec's ADF (Platen works normally), and changing it to Feeder fixed it; an empty feeder also returns 409, which is then treated as feederEmpty, and auto falls back to the flatbed.
+- `Expect: 100-continue` must be turned off: HttpWebRequest sends that header by default and the gSOAP service answers 400; self-signed certificates must be allowed as well.
+- The scan area is fixed at A4 2480×3508 (eSCL areas are measured in 1/300 inch), which fixes the old problem of the driver defaulting to Legal and leaving large white margins on the right/bottom of an A4 original; the resolution takes the nearest step from the capabilities the device reports.
+- Jobs are finished rather than cancelled: after scanning, the job is read to its natural end (404), so that Canceled jobs do not pile up in the device queue and hold the ADF session — in practice that made every following ADF job return 409.
+- WIA fallback kept: machines without eSCL still use the old "one new session per page" WIA path; re-encoding/cropping/PAGE recording is factored out into Finish-PageFile shared by both backends, so behavior stays identical.
+- test/guard-check.ps1 grew to 48 assertions: new pure-function assertions for the eSCL settings document, resolution rounding, input-source identification and backend load relationships; subprocess output now goes through file redirection, so stdout is obtainable in restricted environments.
+
+Real-device result: 3 A4 sheets in the feeder, one job → a 3-page PDF (each page 2480×3508 @300dpi, PDF 685,472 bytes, 15.9 seconds).
+
+### 1.3.4 (fourth real-device test batch: feeder multi-page, part two)
+
+After the 1.3.3 changes the feeder still produced only the first page; after mapping the device behavior with a batch of WIA probes, the multi-page logic was rewritten:
+
+- **Pages (3096) must not be set to 0**: 1.3.3 followed the textbook approach and set 3096 to 0 ("scan until the paper runs out"), but after 3096=0 this HP/WSD driver returns `0x80070057 E_INVALIDARG` for any Transfer, so the very first page never came out; keeping the driver default of 1 made single-page transfers work. Now 3096 is never written at all; instead it is **one new session per page**, using `PAPER_EMPTY` (`0x80210003`) to detect the end of paper.
+- **One session can transfer only one page**: a second Transfer in the same session always reports `0x80004005 Unspecified error` (true for both flatbed and feeder in practice). Now every page re-`Connect`s → selects the source → gets `Items.Item(1)` → resends resolution/format/intent/scan area → Transfer → releases, and then opens the next page; a single page failure is retried at most once (900 ms apart, reconnecting).
+- **The capability-probe session is released early**: the WIA connection used for reading capabilities is released before scanning, to avoid holding two sessions at once (the driver reports "The WIA device is busy").
+- **Empty-feeder and partial-completion semantics unchanged**: an empty feeder → `feederEmpty` and no file is produced; a mid-way failure → the scanned pages are kept as images, and `STAT` records the device name, the source and stoppedBy.
+
+`test/guard-check.ps1` grew to 48 assertions: three new static assertions — "scan.ps1 no longer writes Set-WiaFeederAllPages", "wia-common.ps1 no longer writes 3096", "one session per page (Open-ScanItem / Close-ScanItem exist)".
+
+### 1.3.3 (third real-device test batch: feeder multi-page)
+
+The first real feeder multi-page scan produced only 1 page: three originals were swallowed by the device without any image coming out. Three causes were found and all of them fixed:
+
+- **The feeder scanned only one page**: the driver sets Document Handling / Pages (WIA property 3096) to 1 by default, meaning "feed a single page"; the plugin never changed it to 0 (scan until out of paper), so the ADF stopped after the first sheet. At the time, whenever source=feed was used (or auto landed on the feeder), it first called Set-WiaFeederAllPages to set it to 0. (1.3.4 found on the real device that this makes every subsequent transfer return E_INVALIDARG, so it was changed to a new session per page, see the previous section.)
+- **Format/resolution fell back to driver defaults from the second page on**: every feeder page is a new WIA item, so its properties return to their defaults; the old code sent 4106 (format) and the resolution only for the first page and set only 6146 (intent) for later pages, so the second sheet was transferred in the driver's native format (BMP on this machine, which does not accept direct JPEG transfer) and the driver answered with a generic "Unspecified error". Now every page resends the resolution (6147/6148), format (4106) and intent; with crop=a4 it also sets the scan area for A4 first (6149/6150=0, 6151 ≈ 2480, 6152 ≈ 3508), scanning less white margin and transferring less data.
+- **Generic transfer errors are no longer given up on at once**: while the previous sheet is still being ejected the driver may throw a generic error, which is a retryable transient. Now the same page is tried at most twice: before the second round it waits 700 ms, reconnects the device, resets the source and page properties, and transfers again; only two failures raise an error.
+- **Failed results no longer impersonate success**: previously, on a mid-way failure STAT's stoppedBy still said complete and the device and source were empty, so the host printed "Scan complete: , 1 page." Now failures force stoppedBy=error and write the device name and source into STAT, and the host title becomes "Scan incomplete"; an empty feeder reports feederEmpty separately (no longer disguised as completion).
+- **Scan device names also support prefix matching** (the same as printers): writing NPIC849E4 matches NPIC849E4 (HP Color LaserJet MFP M283cdw); if a prefix matches several devices it reports scannerAmbiguous together with the candidates, instead of picking one at random.
+
+`test/guard-check.ps1` grew to 38 assertions: three new ones — "the A4 scan area at 300 dpi is 2480×3508", "a unique device prefix match", "an ambiguous prefix must error" (all pure functions, no device needed).
+
+### 1.3.2 (issues found in the second real-device test batch)
+
+Real-device scanning tests (flatbed 300 dpi, scan to PDF, grayscale, dpi out of range, `crop=a4`) found and fixed three issues:
+
+- **The scanning pipeline could not run at all**: the scan function in `scan.ps1` used the device entry (a hashtable) as if it were a COM device object (`$chosen.Connect()`), so every call reported "[System.Collections.Hashtable] does not contain a method named Connect" — scanning in 1.3.0/1.3.1 was in fact completely unusable, it had simply never been run on a real device. Changed to `$chosen.info.Connect()`, and the image-processing helpers were moved into a new file `ps/image-common.ps1` to make paperless regression easier.
+- **`crop=a4` cropped A4 down to a quarter**: this driver writes 96 dpi in the file header but actually scans at 300 dpi; 1.3.1 used the header dpi as the cropping ruler, so a full 2479×3507 page was cropped to 794×1123. Now it uses the negotiated resolution read back from the driver (`effectiveDpi`) as the ruler, and falls back to the header only when the negotiated value is unavailable.
+- **Saved images were tagged with the wrong resolution**: same cause; every transcoded jpg was tagged 96 dpi, so other programs laying it out would scale it about 3×. During transcoding the bitmap is now rebuilt at the negotiated resolution (`SetResolution`), so jpgs are tagged 300 dpi.
+
+`test/guard-check.ps1` grew to 35 assertions: four new ones — "transcoding writes the negotiated resolution", "A4 cropping uses the negotiated resolution and does not miscrop", "long feeder pages are cropped to A4".
+
+### 1.3.1 (issues found in the first real-device test batch)
+
+In October 2026, three batches of real-device tests — "read-only queries, print to file, error paths" — were run on an HP Color LaserJet MFP M283cdw, which found and fixed four issues:
+
+- **Capabilities are no longer reported as "unknown"**: this HP V4 driver's `Win32_Printer` has no `Duplex`/`Color` properties at all, and 1.3.0 read only those two, so `printer_info` reported "duplex/color: unknown" for a machine that supports color duplex printing. 1.3.1 resolves the value in three steps — WMI properties, then the `Win32_Printer.Capabilities` capability bits (2=color, 4=duplex), then GDI `PrinterSettings.CanDuplex`/`SupportsColor` — and the `CAPS` record carries two extra source fields; the host marks inferred values as "(inferred from driver capability bits)" or "(inferred from the print driver interface)" instead of passing inference off as driver fact.
+- **Scanning devices carry their own online state**: the same all-in-one is registered both as a WIA entry and as an eSCL entry, the eSCL one being offline for long periods, and `scanner_scan` without `device` used to take the first one, which could happen to be the offline entry. Now `scanner_list` tries each device and marks it "available / cannot open right now", and `scanner_scan` without a device automatically picks the first one that opens, reporting `deviceError` with each device's error only when none of them opens.
+- **Unknown-printer text got its period**: `no printer named "X" is installed. Available: …` had no period at the end, so it ran into the following suggestion (`Retry with mode=queue …`) as a single sentence.
+- **Scan resolution description corrected**: the tool description no longer hard-codes "up to 1200" but says "75–1200 may be given; what is actually reachable is decided by the device", and suggests checking `scanner_info` first; this machine actually has only 75/150/300 dpi.
+
+`test/guard-check.ps1` grew to 30 assertions: new ones for the unknown-printer text, the 12 `CAPS` fields and source fields, capability-bit/GDI fallback, host parsing of the source, scanner availability fields, and skipping unopenable devices for default scanning.
+
+## Earlier versions (1.2.2 security patch / 1.2.1 fix / 1.2.0 additions)
+
+- **1.2.2 security patch (important)**: `gdi` mode accepts only text and images, but it now **sniffs the file content before rendering**. Previously it looked only at the extension, so explicitly passing `mode=gdi` to print a PDF made the plugin decode the PDF binary as text — a 15-page report thus became a **932-page** job pushed into the print queue. Now files starting with `%PDF-`, `PK` (zip/OOXML), OLE, `{\rtf`, gzip/RAR/7z, `MZ`, ELF, or containing a NUL byte within the first 8192 bytes are rejected outright (error code `notText`), with a hint to use `verb` or to convert to text/images first.
+- **1.2.2 page-count breaker**: a job calculated at more than 200 pages is rejected first (error code `tooManyPages`); once you are sure of the file, `allowHugeJob=true` lets it through. Both gates act before the print spooler is actually touched, so no job is created.
+- **1.2.2 incidental**: `print-gdi.ps1` now carries its own `Read-TextSmart`, so the GDI backend can be dot-sourced independently and tested directly by regression scripts; added `test/guard-check.ps1` (48 assertions as of 1.3.4, never touching the print spooler, never consuming paper).
+- **1.2.1 fix**: in `gdi` mode, `duplex=long` (flip on the long edge) came out rotated 180° on the back side — 1.2.0 mapped the long edge to .NET `Duplex.Horizontal` (short-edge binding) by mistake, and it has been changed to `long→Vertical` / `short→Horizontal` according to real-device tests.
+- Printing can decide **whether duplex flips on the long or the short edge** (`duplex=long/short`), and in `gdi` mode it travels with the job without touching the printer's default settings.
+- Printing can decide the **page range** (`pageRange`: `1-3`, `8-`, `odd`, `1-3,5`, …) and the **number of copies** (`copies`).
+- Printing can decide whether multiple copies are **collated** or **uncollated** (`collate`).
+- Added `mode=gdi`: the plugin renders every page itself, in-process (text and images), so page range / copy order / duplex are all controllable; real-data verification is under "Known limitations" below.
+- Fixed a silent bug that had existed since 1.0.0: the `mode` parameter was shadowed by a local variable of the same name, so `-mode queue|verb` never took effect (it went unnoticed only because `auto`'s routing happened to match).
+
+## Installation
+
+The official entry point is DSH's plugin manager (`plugin_manager` / the plugins page in the GUI); **do not hand-edit the profile's `package.json` and `cordis.patch.yml`**.
+
+1. Open DSH's plugin management UI;
+2. Choose "install from local directory / install bundle" and fill the directory with the plugin source directory (or point at `dsh-plugin-printer-1.3.4.tgz`);
+3. Check the returned `application`: `applied` means it is already in effect, `restart-required` means DSH has to be restarted;
+4. Use `cordis_inspect_query` (or the plugin's tool list) to confirm that the `dsh-plugin-printer` line exists.
+
+Upgrading to 1.3.4: reinstall over it through the same entry point; if the profile uses the `link:<plugin source dir>` form, changing the source and **restarting DSH** loads the new `index.js` / `lib/*.js` (`ps/*.ps1` are read fresh on every call, so changes take effect immediately without a restart).
+
+The package itself is a standard host-only Cordis plugin: `package.json` (with `dsh.bundle.patch`) + `cordis.patch.yml` (one `insert` line, whose `name` must equal the package name) + `index.js` (`apply(ctx, config)`). `config` accepts `powershell` (default `powershell.exe`) and `timeoutMs` (default 180000).
+
+## Permissions
+
+- These tools run in the DSH host process with the privileges of the **currently logged-in user**, and are not restricted by the workspace sandbox; DSH itself has no privilege requirements.
+- But WMI (printer status, print queues, printer capabilities), WIA (scanners) and print preferences (PrintManagement) refuse access outright under a **low-integrity/restricted token** (`0x80070005`). In that case the plugin tells you plainly that "normal user privileges are needed", rather than pretending the queue is empty or that the duplex setting succeeded.
+- If it keeps failing on a machine: make sure DSH is not started in a restricted way; on some machines WIA needs the `stisvc` service to be running.
+
+## Known limitations (verified on real hardware)
+
+1. **"Microsoft Print to PDF" does not honor `outputFile`.** Its port is `PORTPROMPT:`, and the driver itself pops up a "Save Print Output As" window that decides the file name and location (usually the desktop, with a generated name). The plugin's approach is: after printing, look in Desktop/Documents/Downloads/temp for the PDF that was just created, **move it to the path you asked for**, and state honestly in the result "where the driver actually wrote it". If the window is left unclicked, the tool waits for a while and then errors, telling you to confirm that window.
+2. **Going through the system "print" verb may change the default printer.** This is Windows' "Let Windows manage my default printer" behavior, not something the plugin does. Since 1.1.0, the plugin refuses outright for types that have no `printto` verb or that ignore the printer parameter (the WPS/Office family), and only `allowDefaultSwitch=true` temporarily changes the default printer and restores it after printing. To turn the auto-switching off entirely: create a DWORD `LegacyDefaultPrinterMode = 1` under `HKCU\Software\Microsoft\Windows NT\CurrentVersion\Windows`. `printer_set_default` can switch the default back at any time.
+3. **Property-setting failures are not silent.** When scanning, if the machine does not accept the requested resolution (for example 200 dpi is requested but this machine supports only 75/150/300), the plugin automatically takes the nearest available value and writes "200 dpi not accepted, actually using 150 dpi" into the result; a format the driver does not support is first captured in its native format and then transcoded, with the native format written into the result. The same applies to duplex: if the setting did not take effect, the result carries a `WARN` and the driver's own words.
+4. **`printer_print` in queue mode is only suitable for plain text.** It lays the text out again as UTF-8 before handing it to the spooler, which keeps Chinese from being mangled; for rich text/images/PDF, let `mode` go through `verb` (or convert to PDF first and then print).
+5. **The queue read-back in a print result may be `unknown`.** A job often stays in the print queue for only a few hundred milliseconds, and the plugin samples only once after submitting; `unknown` means "the job was not seen", not "nothing was printed". Whether paper physically came out, and whether duplex was applied, cannot be confirmed by software.
+6. **In `queue`/`verb` modes, `duplex` changes this printer's default print preference** (Windows print preferences), not just the current job; the plugin restores the original value after the job, and reports a `WARN` in the result if restoring fails. Other programs printing during that window are affected as well. `gdi` mode does not have this problem — it does not change preferences.
+7. **`gdi` can print only text and images, and page range / collation work only on that path.** PDF, Word/Excel/PPT and the like can still only be handed to the system "print" verb or the associated program, and the plugin cannot step in; passing `pageRange` or `collate=false` for such files is rejected explicitly, with a hint to switch to `gdi` (or convert to text/images first).
+8. **`gdi` + `outputFile` does not work with "Microsoft Print to PDF".** This driver ignores print-to-file (it reports `can't open file for write !`); to print to PDF, use `mode=file`, or switch to a queue that supports print-to-file (such as "Microsoft XPS Document Writer").
+9. **GDI queue names may differ from the names in `printer_list`** (for example the list shows `Microsoft XPS Document Writer v4` while GDI has `Microsoft XPS Document Writer`). The plugin matches them automatically and writes the name it actually used into the result.
+10. **`gdi` mode's two safety gates (1.2.2).** First gate: anything other than text/images (PDF, Office files, archives, executables) is rejected before rendering, error code `notText`, with a hint to use `verb` or convert first — this fixes the "PDF rendered as text into 932 pages" accident. Second gate: a job calculated above the page limit (200 pages by default, adjustable with `maxPages`) is rejected first (`tooManyPages`), and after confirming it can be let through with `allowHugeJob=true`. Both gates act before the print spooler is touched, so no job is created.
+11. **An empty feeder is a normal end.** Only when not a single page was scanned and the device has no flatbed either is "the feeder has no paper" reported; pages already scanned are kept (the PDF will contain the pages that were scanned). `crop=a4` is a destructive crop — do not enable it for non-A4 originals.
+12. **Cancel/purge is decided by read-back (1.3.0).** `cancel`/`purge` in `printer_jobs` delete first and then read the queue once more: a job still there reports `stillQueued`, an unreadable queue reports `verifyFailed`, and success is never declared from a single delete call; the result carries the requested count, the confirmed-deleted count and the remaining count.
+13. **`-PlanOnly` works only on the `gdi` path (1.3.0).** `queue`/`verb`/print-to-file cannot be previewed without printing, so passing it reports `planOnlyUnsupported` directly; to see a page-range/copies/duplex plan, route the file through `gdi` (text or images).
+14. **Multi-page PDFs have a size limit (1.3.0).** Once the total exceeds 512 MB, assembly stops and reports `pdfTooLarge`, while the pages already scanned are still reported; use `format=jpg` or a lower resolution instead.
+15. **Capability values may be inferred rather than reported by the driver (1.3.1).** Some drivers (like this HP's V4 driver) do not expose `Win32_Printer.Duplex`/`Color` at all, so `printer_info` falls back in turn to capability bits and the GDI driver interface, and marks the result "inferred from driver capability bits / inferred from the print driver interface". The actual outcome (whether duplex takes effect, whether it prints in color) is still subject to the print job and the paper that comes out.
+16. **Devices in the scanner list may be duplicated (1.3.1).** An all-in-one is often registered both as a WIA device and as an eSCL device, the latter possibly offline for long periods; `scanner_list` tries each one and marks whether it can be opened right now, and `scanner_scan` without `device` automatically skips entries that cannot be opened. If an offline entry is specified explicitly, it reports the error honestly instead of falling back to another device.
+17. **The scanning resolution ceiling varies by machine (1.3.1).** The parameter allows 75–1200, but the steps that are actually usable are decided by the driver (this machine has only 75/150/300); the plugin takes the nearest step and writes `effectiveDpi` into the result; check `scanner_info` if you want to know the available steps beforehand.
+
+19. **Feeder multi-page (1.3.4/1.3.5).** Since 1.3.5 the feeder prefers eSCL; falling back to WIA relies on "one WIA session per page + PAPER_EMPTY to finish": every page reconnects the device and resends format/resolution/scan area, and a failed page is retried once. Setting `Pages`(3096) to 0 makes every subsequent transfer fail with `E_INVALIDARG`, so the plugin never writes that property. An empty feeder ends normally and keeps the scanned pages; on a mid-way error the scanned pages are still saved as images.
+20. **The feeder's default scan area may be Legal (1.3.3).** This HP/WSD driver sets the feeder's default area to 8.5×14 inches (2550×4200 @300dpi), so an A4 original gets extra blank space on the right/bottom; `crop=a4` now sets the area for A4 first and then crops according to the negotiated resolution after scanning. Do not enable `crop=a4` when the original is not A4.
+
+## Directory structure
+
+```
+dsh-plugin-printer/
+  package.json          # package metadata + dsh.bundle.patch pointing at the patch file
+  cordis.patch.yml      # inserts one line into the Cordis tree
+  index.js              # plugin entry: registers 9 tools, localizes results
+  lib/ps.js             # starts powershell, parses records separated by US(0x1f), kills the process tree on timeout, falls back to temp-file capture when pipes are denied; returns already-parsed records even on error
+  lib/printers.js       # printers: list/capabilities/default/test page/print/queue (queue deletion carries read-back fields)
+  lib/scanners.js       # scanners: enumerate/capabilities/scan (including PDF, partial success and STAT)
+  lib/errors.js         # error code → localized text (printing/queue/scanning unified in one place)
+  ps/print-common.ps1   # registry reads, print verb detection, printer status flags, available printer list, error text
+  ps/wia-common.ps1     # WIA device enumeration, property reads/writes, format and resolution negotiation
+  ps/escl-common.ps1    # eSCL (network scanning) client: capabilities/status/create job/fetch pages/clean up leftover jobs
+  ps/list-printers.ps1  ps/printer-caps.ps1  ps/printer-action.ps1  ps/printer-jobs.ps1
+  ps/print-file.ps1     # print entry point (routing + queue / verb / print-to-file / duplex / state to restore)
+  ps/print-gdi.ps1      # GDI per-page rendering: page range, copy order (collated/uncollated), duplex direction, line wrapping and crop area
+  ps/list-scanners.ps1  ps/scanner-info.ps1  ps/scan.ps1  ps/pdf.ps1
+  locale/zh.json        # plugin title and description
+  icon.svg
+  test/guard-check.ps1  # paperless regression (48 assertions, runs without DSH installed)
+```
+
+`ps/*.ps1` all stay pure ASCII: PowerShell 5.1 reads scripts as ANSI when there is no BOM, so Chinese lives only on the JS side to avoid mojibake.
+
+## Local testing (without installing DSH)
+
+```powershell
+cd dsh-plugin-printer
+
+# paperless regression: 48 assertions, never touches the print spooler, never consumes paper
+powershell -NoProfile -ExecutionPolicy Bypass -File ./test/guard-check.ps1
+
+# show only the page range / copies / duplex print plan, without actually printing
+powershell -NoProfile -ExecutionPolicy Bypass -File ./ps/print-file.ps1 -Path ./README.md -PageRange 2-3 -Copies 3 -PlanOnly
+```
+
+`test/guard-check.ps1` depends only on `ps/*.ps1` and the built-in Windows PowerShell / System.Drawing, so it runs without DSH installed; it covers content sniffing, the page-count breaker, UTF-16 text, `.pdf`/`.docx` verb detection, `-PlanOnly` interception, queue read-back fields, capability source fields, scanner availability and `maxPages` passthrough.
+
+## Uninstallation
+
+Uninstall it in the plugin manager, or remove `dsh-plugin-printer` from the profile's `dsh.profile.bundles` and restart DSH.
+
+21. **Scanning prefers eSCL (1.3.5).** If a network scanner offers eSCL over HTTPS, the plugin uses it first — only it can scan a whole feeder stack in one job; machines without eSCL fall back to WIA, and some WIA drivers (like this HP) do not support multi-page, so the feeder produces only 1 page per pass.
+22. **eSCL's feeder goes only up to 300 dpi.** The flatbed can reach 1200 dpi, the ADF caps at 300 dpi; beyond that the nearest step is taken automatically and written into effectiveDpi.
+
+18. **Scan grayscale/black-and-white depends on the driver (1.3.2).** `mode=gray` and `mode=text` only pass the intent to WIA, and the driver does not necessarily honor it: on the test machine `gray` did return grayscale images, while `text` still returned color/grayscale images. The actual content of the output file is authoritative; the plugin does not convert anything again on the driver's behalf.

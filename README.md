@@ -220,7 +220,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./ps/print-file.ps1 -Path ./
 
 ## 许可证
 
-本项目以 **GNU Affero 通用公共许可证第 3 版（AGPL-3.0）** 发布，许可证全文见 [LICENSE](LICENSE)。
+本项目以 **MIT 许可** 发布，许可证全文见 [LICENSE](LICENSE)。
 
 简单说：你可以自由使用、修改、分发，包括商业用途；但只要把修改后的版本提供给他人使用（包括通过网络提供服务），就必须以同一许可证公开完整源代码。
 
